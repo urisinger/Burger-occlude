@@ -134,6 +134,10 @@ class BlocksTopping(Topping):
         requires_correct_tool_for_drops_setter = MAPPINGS.get_method_from_classfile(
             properties_cf, 'requiresCorrectToolForDrops'
         )
+
+        no_occlusion_setter = MAPPINGS.get_method_from_classfile(
+            properties_cf, 'noOcclusion'
+        )
         friction_setter = MAPPINGS.get_method_from_classfile(properties_cf, 'friction')
         light_setter = MAPPINGS.get_method_from_classfile(properties_cf, 'lightLevel')
 
@@ -311,6 +315,11 @@ class BlocksTopping(Topping):
                         and method_desc == friction_setter.descriptor.value
                     ):
                         obj['friction'] = args[0]
+                    elif (
+                        method_name == no_occlusion_setter.name.value
+                        and method_desc == no_occlusion_setter.descriptor.value
+                    ):
+                        obj['can_occlude'] = False
                     elif method_name == '<init>':
                         # Call to the constructor for the block
                         # The majority of blocks have a 1-arg constructor simply taking the builder.
