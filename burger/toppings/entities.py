@@ -5,7 +5,6 @@ from jawa.classloader import ClassLoader
 from jawa.constants import ConstantClass, String
 from jawa.util.descriptor import method_descriptor
 
-from burger.mappings import MAPPINGS
 from burger.util import WalkerCallback, class_from_invokedynamic, walk_method
 
 from .topping import Topping
@@ -40,33 +39,10 @@ class EntityTopping(Topping):
         entities = aggregate.setdefault('entities', {})
         entity = entities.setdefault('entity', {})
 
-        # Find the inner builder class
-        inner_classes = cf.attributes.find_one(name='InnerClasses').inner_classes
-        builderclass = None
-        funcclass = None  # 19w08a+ - a functional interface for creating new entities
-        for entry in inner_classes:
-            if entry.outer_class_info_index == 0:
-                # Ignore anonymous classes
-                continue
-
-            outer = cf.constants.get(entry.outer_class_info_index)
-            if outer.name == listclass:
-                inner = cf.constants.get(entry.inner_class_info_index)
-                inner_cf = classloader[inner.name.value]
-                if inner_cf.access_flags.acc_interface:
-                    if funcclass:
-                        raise Exception('Unexpected multiple inner interfaces')
-                    funcclass = inner.name.value
-                else:
-                    if builderclass:
-                        raise Exception('Unexpected multiple inner classes')
-                    builderclass = inner.name.value
-
-        if not builderclass:
-            raise Exception(
-                'Failed to find inner class for builder in ' + str(inner_classes)
-            )
-        # Note that funcclass might not be found since it didn't always exist
+        builder_class = 'net/minecraft/world/entity/EntityType$Builder'
+        assert classloader[builder_class]
+        func_class = 'net/minecraft/world/entity/EntityType$EntityFactory'
+        assert classloader[func_class]
 
         method = cf.methods.find_one(name='<clinit>')
 
@@ -78,16 +54,15 @@ class EntityTopping(Topping):
         # and in even older versions:
         # public static final EntityType<EntityAreaEffectCloud> AREA_EFFECT_CLOUD = register("area_effect_cloud", EntityType.Builder.create(EntityAreaEffectCloud::new)); // through 18w05a
 
-        entity_type_builder_cf = MAPPINGS.get_class_from_classloader(
-            classloader,
-            'net.minecraft.world.entity.EntityType$Builder',
+        entity_type_builder_cf = classloader[
+            'net/minecraft/world/entity/EntityType$Builder'
+        ]
+        set_size_method = entity_type_builder_cf.methods.find_one(name='sized')
+        assert set_size_method
+        set_eye_height_method = entity_type_builder_cf.methods.find_one(
+            name='eyeHeight'
         )
-        set_size_method = MAPPINGS.get_method_from_classfile(
-            entity_type_builder_cf, 'sized'
-        )
-        set_eye_height_method = MAPPINGS.get_method_from_classfile(
-            entity_type_builder_cf, 'eyeHeight'
-        )
+        assert set_eye_height_method
         print('set_eye_height_method', set_eye_height_method)
 
         class EntityContext(WalkerCallback):
@@ -116,7 +91,7 @@ class EntityTopping(Topping):
 
                     entity[name] = new_entity
                     return new_entity
-                elif const.class_.name == builderclass:
+                elif const.class_.name == builder_class:
                     if ins.mnemonic != 'invokestatic':
                         if (
                             const.name_and_type.name.value == set_size_method.name
@@ -150,7 +125,7 @@ class EntityTopping(Topping):
                             cls = args[1]
                         elif (
                             desc.args[0].name == 'java/util/function/Function'
-                            or desc.args[0].name == funcclass
+                            or desc.args[0].name == func_class
                         ):
                             # Builder.create(Function, EntityCategory), 19w05a+
                             cls = args[0]
@@ -323,3 +298,4 @@ class EntityTopping(Topping):
         abstract_entity('chested_horse', 'mule')  # AbstractChestedHorse
         abstract_entity('piglin', 'piglin')  # AbstractChestedHorse
         abstract_entity('avatar', 'mannequin')  # Avatar
+        abstract_entity('nautilus', 'zombie_nautilus')  # AbstractNautilus

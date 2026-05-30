@@ -4,13 +4,12 @@ import traceback
 import six
 from jawa.cf import ClassFile
 from jawa.classloader import ClassLoader
-from jawa.constants import ConstantClass, String
+from jawa.constants import String
 
 from burger.util import (
     InvokeDynamicInfo,
     LambdaInvokeDynamicInfo,
     WalkerCallback,
-    string_from_invokedymanic,
     walk_method,
 )
 
@@ -43,11 +42,9 @@ class EntityMetadataTopping(Topping):
         synched_entity_data_class = aggregate['classes']['metadata']
         synched_entity_data_cf = classloader[synched_entity_data_class]
 
-        # get the SynchedEntityData.Builder class, which happens to be the first inner class
-        synched_entity_data_builder_class = synched_entity_data_cf.constants.find_one(
-            type_=ConstantClass,
-            f=lambda c: c.name.value.startswith(synched_entity_data_class + '$'),
-        ).name.value
+        synched_entity_data_builder_class = (
+            'net/minecraft/network/syncher/SynchedEntityData$Builder'
+        )
         synched_entity_data_builder_cf = classloader[synched_entity_data_builder_class]
 
         define_id_method = synched_entity_data_cf.methods.find_one(
@@ -57,59 +54,22 @@ class EntityMetadataTopping(Topping):
         entity_data_serializer_class = define_id_method.args[1].name
 
         define_method = synched_entity_data_builder_cf.methods.find_one(
-            f=lambda m: len(m.args) == 2
-            and m.args[0].name == entity_data_accessor_class
+            f=lambda m: (
+                len(m.args) == 2 and m.args[0].name == entity_data_accessor_class
+            )
         )
 
-        # net.minecraft.network.syncher.EntityDataSerializers
-        entity_data_serializers_class = None
-        for ins in define_method.code.disassemble():
-            # The code looks up an ID and throws an exception if it's not registered
-            # We want the class that it looks the ID up in
-            if ins == 'invokestatic':
-                const = ins.operands[0]
-                candidate_class = const.class_.name.value
-                if not candidate_class.startswith('java/'):
-                    entity_data_serializers_class = candidate_class
-            elif entity_data_serializers_class and ins in ('ldc', 'ldc_w'):
-                const = ins.operands[0]
-                if const == 'Unregistered serializer ':
-                    break
-            elif entity_data_serializers_class and ins == 'invokedynamic':
-                text = string_from_invokedymanic(ins, synched_entity_data_builder_cf)
-                if 'Unregistered serializer ' in text:
-                    break
-        else:
-            raise Exception('Failed to identify dataserializers')
-
-        assert not entity_data_serializers_class.startswith('java/'), (
-            f'entity_data_serializers_class should not be a java class: {entity_data_serializers_class}'
+        entity_data_serializers_class = (
+            'net/minecraft/network/syncher/EntityDataSerializers'
         )
+        assert classloader[entity_data_serializers_class]
 
         base_entity_class = entities['~abstract_entity']['class']
         base_entity_cf = classloader[base_entity_class]
-        define_synched_data_method_name = None
-        define_synched_data_method_desc = None
-        # The last call in the base entity constructor is to registerData() (formerly entityInit())
-        for ins in base_entity_cf.methods.find_one(name='<init>').code.disassemble():
-            if ins.mnemonic == 'invokevirtual':
-                const = ins.operands[0]
-                candidate_method = base_entity_cf.methods.find_one(
-                    name=const.name_and_type.name.value,
-                    f=lambda m: m.descriptor == const.name_and_type.descriptor,
-                )
-                # protected void defineSynchedData(SynchedEntityData.Builder var1)
-                if (
-                    candidate_method
-                    and len(candidate_method.args) == 1
-                    and candidate_method.args[0].name
-                    == synched_entity_data_builder_class
-                ):
-                    define_synched_data_method_name = const.name_and_type.name.value
-                    define_synched_data_method_desc = (
-                        const.name_and_type.descriptor.value
-                    )
-                    # Keep looping, to find the last call
+        define_synched_data_method_name = 'defineSynchedData'
+        define_synched_data_method_desc = (
+            '(Lnet/minecraft/network/syncher/SynchedEntityData$Builder;)V'
+        )
 
         dataserializers = EntityMetadataTopping.identify_serializers(
             classloader,
@@ -207,15 +167,10 @@ class EntityMetadataTopping(Topping):
                 index = ctx.cur_index
 
             class MetadataDefaultsContext(WalkerCallback):
-                def __init__(self, wait_for_putfield=False):
+                def __init__(self):
                     self.textcomponentstring = None
-                    # True while waiting for "this.dataManager = new EntityDataManager(this);" when going through the entity constructor
-                    self.waiting_for_putfield = wait_for_putfield
 
                 def on_invoke(self, ins, const, obj, args):
-                    if self.waiting_for_putfield:
-                        return
-
                     if 'Optional' in const.class_.name.value:
                         if const.name_and_type.name in ('absent', 'empty'):
                             return 'Empty'
@@ -240,6 +195,10 @@ class EntityMetadataTopping(Topping):
 
                         return
                     elif const.class_.name == synched_entity_data_builder_class:
+                        if const.name_and_type.name.value == 'build':
+                            # this is called near the end of Entity's <init>
+                            return
+
                         assert const.name_and_type.name == define_method.name
                         assert (
                             const.name_and_type.descriptor == define_method.descriptor
@@ -262,26 +221,19 @@ class EntityMetadataTopping(Topping):
                     ):
                         # Call to super.registerData()
                         return
+                    elif const.name_and_type.name.value == 'getMaxAirSupply':
+                        # hardcoded so we don't have to simulate a call to the function (which is
+                        # just a single return). this might be worth improving if there end up
+                        # being more functions like it, though.
+                        return 300
 
                 def on_invokedynamic(self, ins, const, args):
-                    # used in Wolf for
-                    # var1.define(DATA_VARIANT_ID, var3.get(WolfVariants.DEFAULT).or(var3::getAny).orElseThrow());
-
-                    return
+                    pass
 
                 def on_put_field(self, ins, const, obj, value):
-                    if (
-                        const.name_and_type.descriptor
-                        == 'L' + synched_entity_data_builder_class + ';'
-                    ):
-                        if not self.waiting_for_putfield:
-                            raise Exception('Unexpected putfield: %s' % (ins,))
-                        self.waiting_for_putfield = False
+                    pass
 
                 def on_get_field(self, ins, const, obj):
-                    if self.waiting_for_putfield:
-                        return
-
                     if (
                         const.name_and_type.descriptor
                         == 'L' + entity_data_accessor_class + ';'
@@ -312,15 +264,15 @@ class EntityMetadataTopping(Topping):
                         return None
 
                 def on_new(self, ins, const):
-                    if self.waiting_for_putfield:
-                        return
-
                     if const.name.value == 'org/joml/Quaternionf':
                         return {'x': 0, 'y': 0, 'z': 0, 'w': 1}
                     elif const.name.value == 'org/joml/Vector3f':
                         return {'x': 0, 'y': 0, 'z': 0}
 
-                    elif self.textcomponentstring is None:
+                    elif (
+                        self.textcomponentstring is None
+                        and const.name.value.startswith('net/minecraft/')
+                    ):
                         # Check if this is TextComponentString
                         temp_cf = classloader[const.name.value]
                         for str in temp_cf.constants.find(type_=String):
@@ -338,12 +290,12 @@ class EntityMetadataTopping(Topping):
                 f=lambda m: m.descriptor == define_synched_data_method_desc,
             )
             if register and not register.access_flags.acc_abstract:
-                walk_method(cf, register, MetadataDefaultsContext(False))
+                walk_method(cf, register, MetadataDefaultsContext())
             elif cls == base_entity_class:
                 walk_method(
                     cf,
                     cf.methods.find_one(name='<init>'),
-                    MetadataDefaultsContext(True),
+                    MetadataDefaultsContext(),
                 )
 
             get_flag_method = None
@@ -417,7 +369,6 @@ class EntityMetadataTopping(Topping):
                                         bitfields_by_class[base_entity_cls] = []
                                     bitfields_by_class[base_entity_cls].append(
                                         {
-                                            # we include the class here so it can be easily figured out from the mappings
                                             'class': cls,
                                             'method': method.name.value,
                                             'mask': 1 << bitmask_value,
@@ -624,11 +575,6 @@ class EntityMetadataTopping(Topping):
                 if name is not None:
                     value['name'] = name
 
-                # Perform decompilation
-                # In new versions (at the latest 24w09b), all metadata fields
-                # are codecs now, so decompilation doesn't work (and thus has been commented out)
-
-                # EntityMetadataTopping._decompile_serializer(classloader, classloader[value["class"]], classes, value, thunks, value["special_fields"])
                 del value['special_fields']
 
                 self.serializers_by_field[field] = value
@@ -691,6 +637,11 @@ class EntityMetadataTopping(Topping):
             inner_type = inner_type[inner_type.index('<') + 1 : inner_type.rindex('>')][
                 1:-1
             ]
+        if '<' in inner_type:
+            inner_type = inner_type.split('<')[-1]
+            if inner_type[0] == 'L':
+                inner_type = inner_type[1:]
+            inner_type = inner_type.strip(':>;')
 
         if inner_type.startswith('java/lang/'):
             name = inner_type[len('java/lang/') :]
@@ -744,41 +695,3 @@ class EntityMetadataTopping(Topping):
             return name_prefix + name
         else:
             return None
-
-    @staticmethod
-    def _decompile_serializer(
-        classloader: ClassLoader,
-        cf: ClassFile,
-        classes,
-        serializer,
-        thunks,
-        special_fields,
-    ):
-        # In here because otherwise the import messes with finding the topping in this file
-        from .packetinstructions import PACKETBUF_NAME
-        from .packetinstructions import PacketInstructionsTopping as _PIT
-
-        # Decompile the serialization code.
-        # Note that we are using the bridge method that takes an object,
-        # and not the more specific method that for the given serializer which is
-        # called by that bridge (_PIT.operations will inline that call for us)
-        try:
-            write_args = 'L' + classes['packet.packetbuffer'] + ';Ljava/lang/Object;'
-            methods = list(cf.methods.find(returns='V', args=write_args))
-            assert len(methods) == 1
-            operations = _PIT.operations(
-                classloader,
-                cf,
-                classes,
-                methods[0],
-                ('this', PACKETBUF_NAME, 'value'),
-                thunks,
-                special_fields,
-            )
-            serializer.update(_PIT.format(operations))
-        except Exception:
-            logging.debug(
-                f'Failed to process operations for metadata serializer {serializer}'
-            )
-            if logging.root.isEnabledFor(logging.DEBUG):
-                traceback.print_exc()
